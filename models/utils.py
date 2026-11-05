@@ -6,12 +6,6 @@ from torch import nn
 
 
 def print_model_params(model):
-    """
-    打印模型的可训练参数信息（简洁版）
-
-    Args:
-        model: PyTorch模型
-    """
     total_params = 0
     trainable_params = 0
 
@@ -38,14 +32,6 @@ def print_model_params(model):
 
 
 def print_model_grads(model, loss=None):
-    """
-    打印模型的参数梯度信息（简洁版）
-
-    Args:
-        model: PyTorch模型
-        loss: 损失值，如果提供则先执行反向传播
-    """
-    # 如果需要，先执行反向传播
     if loss is not None:
         model.zero_grad()
         loss.backward()
@@ -100,45 +86,27 @@ def print_model_grads(model, loss=None):
 
 
 def copy_weights_to_modules_to_save(peft_model, original_model, modules_to_save):
-    """
-    将原始模型中指定模块的权重复制到PEFT模型的可训练副本中。
-
-    Args:
-        peft_model: 通过 get_peft_model 创建的PEFT模型。
-        original_model: 原始的、未被PEFT包装的模型。
-        modules_to_save: 与LoraConfig中相同的模块名称列表。
-    """
-    # PEFT模型通常将原始模型包装在 .base_model.model 中
-    # 而可训练的副本则在 .base_model 中
     peft_base_model = peft_model.base_model
     original_base_model = original_model
 
     print("Copying weights from original model to PEFT model's trainable modules...")
     for module_name in modules_to_save:
         try:
-            # 从原始模型中获取模块
-            # 使用 getattr 安全地获取嵌套模块
             original_module = original_base_model
             for name_part in module_name:
                 original_module = getattr(original_module, name_part)
 
-            # 从PEFT模型中获取新创建的可训练模块
             peft_module = peft_base_model
             for name_part in module_name.split('.'):
                 peft_module = getattr(peft_module, name_part)
 
-            # 复制权重
-            # 使用 load_state_dict 可以方便地复制所有参数（weight, bias等）
             peft_module.load_state_dict(original_module.state_dict())
 
             print(f"  - Successfully copied weights for module: {module_name}")
 
-            # (可选) 验证复制是否成功
             with torch.no_grad():
-                # 比较权重
                 if not torch.equal(peft_module.weight, original_module.weight):
                     print(f"  ! Warning: Weights for {module_name} do not match after copy!")
-                # 如果有偏置，也比较偏置
                 if hasattr(peft_module, 'bias') and peft_module.bias is not None:
                     if not torch.equal(peft_module.bias, original_module.bias):
                         print(f"  ! Warning: Bias for {module_name} do not match after copy!")
@@ -151,15 +119,12 @@ def copy_weights_to_modules_to_save(peft_model, original_model, modules_to_save)
 
 def compare_all_modules_to_save(peft_model):
     print("=== 开始对比所有ModulesToSaveWrapper的参数 ===")
-    # 遍历PEFT模型中所有模块，只找ModulesToSaveWrapper类型的
     for module_name, wrapper_module in peft_model.named_modules():
         if isinstance(wrapper_module, ModulesToSaveWrapper):
             print(f"\n模块名: {module_name}")
-            # 直接取Wrapper里的original和saved模块
             orig_module = wrapper_module.original_module
             saved_module = wrapper_module.modules_to_save["default"]
 
-            # 对比所有参数（weight、bias）
             all_params_match = True
             for (orig_param, saved_param) in zip(orig_module.parameters(), saved_module.parameters()):
                 if not torch.allclose(orig_param, saved_param, atol=1e-8):
@@ -180,20 +145,7 @@ def compare_model_parameters(
         atol: float = 1e-8,
         verbose: bool = True
 ) -> Dict[str, Dict[str, any]]:
-    """
-    比较两个PyTorch模型中相同名称的参数是否一致
 
-    Args:
-        model1: 第一个模型
-        model2: 第二个模型
-        rtol: 相对容差，用于torch.allclose
-        atol: 绝对容差，用于torch.allclose
-        verbose: 是否打印详细信息
-
-    Returns:
-        包含比较结果的字典
-    """
-    # 获取两个模型的参数字典
     params1 = dict(model1.named_parameters())
     params2 = dict(model2.named_parameters())
 
@@ -233,10 +185,8 @@ def compare_model_parameters(
         param1 = params1[name]
         param2 = params2[name]
 
-        # 检查形状是否相同
         shape_match = param1.shape == param2.shape
 
-        # 检查值是否相同（考虑容差）
         if shape_match:
             if torch.allclose(param1, param2, rtol=rtol, atol=atol):
                 value_match = True
@@ -305,21 +255,14 @@ def check_models_identical(
         rtol: float = 1e-5,
         atol: float = 1e-8
 ) -> Tuple[bool, Dict[str, any]]:
-    """
-    检查两个模型是否完全一致（更严格的检查）
 
-    Returns:
-        Tuple[是否一致, 详细比较结果]
-    """
-    # 先比较参数
     results = compare_model_parameters(model1, model2, rtol, atol, verbose=False)
 
-    # 检查是否有仅在其中一个模型中的参数
     if (results['summary']['only_in_model1_count'] > 0 or
             results['summary']['only_in_model2_count'] > 0):
         return False, results
 
-    # 检查所有共有参数是否都相同
+
     all_identical = (results['summary']['identical_count'] ==
                      results['summary']['total_common'])
 
