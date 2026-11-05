@@ -7,8 +7,6 @@ from transformers import Swinv2Model, AutoConfig
 from transformers.models.swinv2.modeling_swinv2 import Swinv2Encoder, Swinv2EncoderOutput, Swinv2ForImageClassification, \
     Swinv2ModelOutput, Swinv2ImageClassifierOutput
 
-
-
 class PersistenceDiagramEncoder(nn.Module):
     """
     Persistence Diagram Encoder
@@ -16,26 +14,30 @@ class PersistenceDiagramEncoder(nn.Module):
     Includes Xavier initialization for linear layers.
     """
 
-    def __init__(self, input_dim=2, hidden_dim=64, output_dim=128):
+    def __init__(self, input_dim=2, hidden_dim=64, output_dim=128, attn_dim=128):
         super(PersistenceDiagramEncoder, self).__init__()
 
         self.point_mlp = nn.Sequential(
-            nn.Linear(6, hidden_dim),  # 6D: birth, death, persistence, birth_death_ratio one-hot
+            nn.Linear(6, hidden_dim),  # 4D: birth, death, persistence, birth_death_ratio
             nn.ReLU(),
             nn.BatchNorm1d(hidden_dim),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.BatchNorm1d(hidden_dim),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, attn_dim)
         )
 
         self.attention = nn.MultiheadAttention(
-            embed_dim=output_dim,
+            embed_dim=attn_dim,
             num_heads=8,
             dropout=0.1,
             batch_first=True
         )
+
+        self.projection = nn.Linear(attn_dim, output_dim)
+
+        self.norm = nn.LayerNorm(output_dim)
 
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
@@ -67,10 +69,10 @@ class PersistenceDiagramEncoder(nn.Module):
         """
         batch_size, num_points, _ = pd_points.shape
 
-
-        birth = pd_points[:, :, 0:1]
-        death = pd_points[:, :, 1:2]
-        persistence = death - birth
+        # Extract birth, death, persistence, birth_death_ratio
+        birth = pd_points[:, :, 0:1]  # [batch_size, num_points, 1]
+        death = pd_points[:, :, 1:2]  # [batch_size, num_points, 1]
+        persistence = death - birth  # [batch_size, num_points, 1]
 
         max_finite_value = 1.0
         persistence = torch.clamp(persistence, min=0.0, max=max_finite_value)
@@ -81,35 +83,73 @@ class PersistenceDiagramEncoder(nn.Module):
         birth_safe = torch.clamp(birth, min=epsilon)
         birth_death_ratio = torch.log(death / birth_safe)
 
+        # Combine all features
         enhanced_features = torch.cat([
             birth, death, persistence, birth_death_ratio, pd_points[:, :, 2:3], pd_points[:, :, 3:4]
             # birth, death, persistence, birth_death_ratio
-        ], dim=-1)
+        ], dim=-1)  # [batch_size, num_points, 4]
 
         enhanced_features = torch.nan_to_num(enhanced_features, nan=0.0, posinf=max_finite_value, neginf=0.0)
 
         reshaped_features = enhanced_features.view(-1, enhanced_features.size(-1))
 
-        point_features = self.point_mlp(reshaped_features)
-        point_features = point_features.view(batch_size, num_points, -1)
+        # Point-level feature extraction
+        point_features = self.point_mlp(reshaped_features)  # [batch_size * num_points, output_dim]
+        point_features = point_features.view(batch_size, num_points, -1)  # [batch_size, num_points, output_dim]
 
+        # Self-attention mechanism
         attended_features, _ = self.attention(point_features, point_features, point_features)
 
-        global_features = torch.mean(attended_features, dim=1)
+        attended_features = self.projection(attended_features)  # [B, N, 1024]
+        attended_features = self.norm(attended_features)
+
+        # Global feature aggregation
+        global_features = torch.mean(attended_features, dim=1)  # [batch_size, output_dim]
 
         return attended_features, global_features
+
+
+class CrossModalFusion(nn.Module):
+
+    def __init__(self, dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim)
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, cond_tokens):
+
+        attn_out, _ = self.cross_attn(query=x, key=cond_tokens, value=cond_tokens)
+        x = self.norm1(x + self.dropout(attn_out))
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_out))
+        return x
 
 
 class PlumSwinv2Encoder(Swinv2Encoder):
     def __init__(self, config, modes, grid_size, pretrained_window_sizes=(0, 0, 0, 0)):
         super().__init__(config, grid_size, pretrained_window_sizes)
-        self.linear_1 = nn.Sequential(nn.Linear(1024, 96), nn.ReLU(), nn.Linear(96, 192))
-        self.linear_2 = nn.Sequential(nn.Linear(1024, 196), nn.ReLU(), nn.Linear(196, 384))
-        self.linear_3 = nn.Sequential(nn.Linear(1024, 256), nn.ReLU(), nn.Linear(256, 768))
-        self.linear_4 = nn.Sequential(nn.Linear(1024, 256), nn.ReLU(), nn.Linear(256, 768))
-        self.topology_branch = PersistenceDiagramEncoder(output_dim=1024)
+        self.linear_1 = nn.Sequential(nn.Linear(512, 32), nn.ReLU(), nn.Linear(32, 192))
+        self.linear_2 = nn.Sequential(nn.Linear(512, 64), nn.ReLU(), nn.Linear(64, 384))
+        self.linear_3 = nn.Sequential(nn.Linear(512, 128), nn.ReLU(), nn.Linear(128, 768))
+        self.linear_4 = nn.Sequential(nn.Linear(512, 128), nn.ReLU(), nn.Linear(128, 768))
+        self.topology_branch = PersistenceDiagramEncoder(output_dim=512)
         self.weightTokenEmbedding = ValueTokenEmbedding(192)
         self.sugarTokenEmbedding = ValueTokenEmbedding(192)
+        self.cross_fusion = CrossModalFusion(dim=192, num_heads=4, dropout=0.1)
         self.norm_weight = nn.LayerNorm(192)
         self.norm_sugar = nn.LayerNorm(192)
         self.modes = modes
@@ -172,10 +212,18 @@ class PlumSwinv2Encoder(Swinv2Encoder):
             x = layer_outputs[0]
 
             if i == 0:
-                weight = self.norm_weight(self.weightTokenEmbedding(weight)).unsqueeze(1).expand_as(x) if 'weight' in self.modes else None
-                sugar = self.norm_sugar(self.sugarTokenEmbedding(sugar)).unsqueeze(1).expand_as(x) if 'sugar' in self.modes else None
-                # x = x + (self.w * weight if weight is not None else 0) + (self.s * sugar if sugar is not None else 0)
-                x = (x + (self.w * weight if weight is not None else 0) + (self.s * sugar if sugar is not None else 0)) / (1 + (self.w if weight is not None else 0) + (self.s if sugar is not None else 0))
+                weight_emb = self.norm_weight(self.weightTokenEmbedding(weight)) if 'weight' in self.modes else None
+                sugar_emb = self.norm_sugar(self.sugarTokenEmbedding(sugar)) if 'sugar' in self.modes else None
+
+                cond_list = []
+                if weight_emb is not None:
+                    cond_list.append(weight_emb.unsqueeze(1))
+                if sugar_emb is not None:
+                    cond_list.append(sugar_emb.unsqueeze(1))
+
+                if len(cond_list) > 0:
+                    cond_tokens = torch.cat(cond_list, dim=1)  # [B, M, 192]
+                    x = self.cross_fusion(x, cond_tokens)
 
             if o is not None:
                 o1 = eval(f"self.linear_{i + 1}(o)")
@@ -305,7 +353,7 @@ class PlumSwinv2ForImageClassification(Swinv2ForImageClassification):
         super().__init__(config)
         self.modes = modes
         self.swinv2 = PlumSwinModel(config, modes)
-        self.topo_head = nn.Linear(1024, classes_num)
+        self.topo_head = nn.Linear(512, classes_num)
         self.head = nn.Linear(in_features=768, out_features=classes_num, bias=True)
         self.dropout = nn.Dropout(0.1)
         del self.classifier
@@ -329,6 +377,7 @@ class PlumSwinv2ForImageClassification(Swinv2ForImageClassification):
             output_hidden_states: Optional[bool] = None,
             interpolate_pos_encoding: bool = False,
             return_dict: Optional[bool] = None,
+            return_pooled_output: Optional[bool] = False,
     ) -> Union[tuple, Swinv2ImageClassifierOutput]:
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -345,7 +394,8 @@ class PlumSwinv2ForImageClassification(Swinv2ForImageClassification):
         pooled_output = outputs[1]
         topo_emb = outputs[0][1]
         logits = self.head(pooled_output)
-
+        if return_pooled_output:
+            return pooled_output, logits, self.topo_head(topo_emb) if 'persistent' in self.modes else None
         return logits, self.topo_head(topo_emb) if 'persistent' in self.modes else None
 
 
@@ -369,6 +419,8 @@ class ValueTokenEmbedding(nn.Module):
         return h0
 
 
+
+
 class WeightedFocalLoss(nn.Module):
     """
     Weighted Focal Loss that considers sample weights
@@ -381,31 +433,24 @@ class WeightedFocalLoss(nn.Module):
         self.class_weights = class_weights
 
     def forward(self, inputs, targets, sample_weights=None):
-        # batch_size, seq_len, num_classes = inputs.shape
-        # inputs = inputs.view(-1, num_classes)  # [batch_size * seq_len, num_classes]
-        # targets = targets.view(-1)  # [batch_size * seq_len]
-
-        # Ensure class_weights is on the same device as inputs
-        weight = self.class_weights.to(inputs.device) if self.class_weights is not None else None
-
-        # compute cross entropy loss
-        ce_loss = F.cross_entropy(inputs, targets, weight=weight, reduction='none')
-        pt = torch.exp(-ce_loss)
-
-        # Focal loss
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-
+        ce_loss_unweighted = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss_unweighted)
+        if self.class_weights is not None:
+            weight = self.class_weights.to(inputs.device)
+            beta = weight[targets]
+        else:
+            beta = 1.0
+        focal_loss = self.alpha * beta * (1 - pt) ** self.gamma * ce_loss_unweighted
         if sample_weights is not None:
             sample_weights = sample_weights.view(-1)
             focal_loss = focal_loss * sample_weights
-
         return focal_loss.mean()
 
 
 def createPeftPlumModel(modes, num_classes=4):
-    config = AutoConfig.from_pretrained("./model\swinv2-tiny-patch4-window8-256")
+    config = AutoConfig.from_pretrained(r"../swinv2-tiny-patch4-window8-256")
     base_model = PlumSwinv2ForImageClassification(config, classes_num=num_classes, modes=modes)
-    pretrained_weights_path = "./model\swinv2-tiny-patch4-window8-256\pytorch_model.bin"
+    pretrained_weights_path = r"../swinv2-tiny-patch4-window8-256\pytorch_model.bin"
     state_dict = torch.load(pretrained_weights_path, map_location='cpu')
     base_model.load_state_dict(state_dict, strict=False)
     peft_config = LoraConfig(
@@ -415,14 +460,9 @@ def createPeftPlumModel(modes, num_classes=4):
         lora_dropout=0.1,
         inference_mode=False,
         modules_to_save=["weightTokenEmbedding", "sugarTokenEmbedding", "topology_branch", "head", "topo_head",
-                       "linear_1", "linear_2", "linear_3", "linear_4", "norm_weight", "norm_sugar",],
-        # task_type="IMAGE_CLS",
+                       "linear_1", "linear_2", "linear_3", "linear_4", "norm_weight", "norm_sugar", "cross_fusion"],
     )
     peft_model = get_peft_model(base_model, peft_config)
     peft_model.print_trainable_parameters()
 
     return peft_model
-
-
-
-
